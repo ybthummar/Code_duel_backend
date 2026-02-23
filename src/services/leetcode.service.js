@@ -1,7 +1,6 @@
 const axios = require("axios");
 const { config } = require("../config/env");
 const { prisma } = require("../config/prisma");
-const { encrypt, decrypt } = require("../utils/encryption");
 const logger = require("../utils/logger");
 
 // LeetCode GraphQL API endpoint
@@ -93,35 +92,16 @@ const USER_SUBMISSIONS_QUERY = `
  * @param {string} leetcodeUsername - LeetCode username
  * @param {Date} startDate - Start date for filtering
  * @param {Date} endDate - End date for filtering
- * @param {string} sessionData - Optional encrypted session data
  * @returns {Array} Array of submissions
  */
-const fetchUserSubmissions = async (
-  leetcodeUsername,
-  sessionData = null
-) => {
+const fetchUserSubmissions = async (leetcodeUsername) => {
   try {
     const headers = {
       "Content-Type": "application/json",
       "User-Agent": "Mozilla/5.0",
     };
 
-    // If session data is provided, decrypt and add to headers
-    if (sessionData) {
-      try {
-        const decryptedSession = decrypt(sessionData);
-        const sessionObj = JSON.parse(decryptedSession);
-
-        if (sessionObj.cookie) {
-          headers["Cookie"] = sessionObj.cookie;
-        }
-        if (sessionObj.csrfToken) {
-          headers["X-CSRFToken"] = sessionObj.csrfToken;
-        }
-      } catch (error) {
-        logger.warn("Failed to decrypt session data:", error.message);
-      }
-    }
+    const submissionLimit = config.leetcodeSubmissionFetchLimit || 100;
 
     // Fetch recent submissions (up to 100 to ensure date-range coverage)
     const response = await axios.post(
@@ -187,71 +167,10 @@ const parseSubmissions = async (submissions) => {
 };
 
 /**
- * Get or fetch LeetCode session for a user
- * @param {string} userId - User ID
- * @returns {string|null} Encrypted session data or null
- */
-const getUserSession = async (userId) => {
-  const session = await prisma.leetCodeSession.findFirst({
-    where: {
-      userId,
-      isActive: true,
-      OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
-    },
-    orderBy: {
-      lastUsedAt: "desc",
-    },
-  });
-
-  if (session) {
-    // Update last used timestamp
-    await prisma.leetCodeSession.update({
-      where: { id: session.id },
-      data: { lastUsedAt: new Date() },
-    });
-
-    return session.sessionData;
-  }
-
-  return null;
-};
-
-/**
- * Store LeetCode session for a user (encrypted)
- * @param {string} userId - User ID
- * @param {Object} sessionData - Session data to store
- * @param {Date} expiresAt - Optional expiration date
- * @returns {Object} Created session record
- */
-const storeUserSession = async (userId, sessionData, expiresAt = null) => {
-  const encryptedData = encrypt(JSON.stringify(sessionData));
-
-  // Deactivate old sessions
-  await prisma.leetCodeSession.updateMany({
-    where: { userId },
-    data: { isActive: false },
-  });
-
-  // Create new session
-  const session = await prisma.leetCodeSession.create({
-    data: {
-      userId,
-      sessionData: encryptedData,
-      csrfToken: sessionData.csrfToken ? encrypt(sessionData.csrfToken) : null,
-      expiresAt,
-    },
-  });
-
-  logger.info(`LeetCode session stored for user: ${userId}`);
-
-  return session;
-};
-
 /**
  * Fetch submissions for a specific date (helper function)
  * @param {string} leetcodeUsername - LeetCode username
  * @param {Date} date - Date to fetch submissions for
- * @param {string} sessionData - Optional session data
  * @returns {Array} Submissions for the date
  */
 const fetchSubmissionsForDate = async (
@@ -286,14 +205,11 @@ const fetchSubmissionsForDate = async (
 
 /**
  * Core function to make GraphQL requests to LeetCode
- * Handles session cookies, CSRF tokens, and error handling
- *
  * @param {string} query - GraphQL query string
  * @param {Object} variables - Query variables
- * @param {string|null} sessionData - Encrypted session data
  * @returns {Promise<Object>} GraphQL response data
  */
-const fetchLeetCodeData = async (query, variables, sessionData = null) => {
+const fetchLeetCodeData = async (query, variables) => {
   try {
     // Prepare headers
     const headers = {
@@ -303,24 +219,6 @@ const fetchLeetCodeData = async (query, variables, sessionData = null) => {
       Referer: "https://leetcode.com/",
       Origin: "https://leetcode.com",
     };
-
-    // Add session cookies if provided (for authenticated requests)
-    if (sessionData) {
-      try {
-        const decryptedSession = decrypt(sessionData);
-        const sessionObj = JSON.parse(decryptedSession);
-
-        if (sessionObj.cookie) {
-          headers["Cookie"] = sessionObj.cookie;
-        }
-        if (sessionObj.csrfToken) {
-          headers["X-CSRFToken"] = sessionObj.csrfToken;
-          headers["X-Requested-With"] = "XMLHttpRequest";
-        }
-      } catch (error) {
-        logger.warn("Failed to decrypt session data:", error.message);
-      }
-    }
 
     // Make GraphQL request
     const response = await axios.post(
@@ -347,9 +245,7 @@ const fetchLeetCodeData = async (query, variables, sessionData = null) => {
       const status = error.response.status;
       if (status === 429) {
         throw new Error("Rate limit exceeded. Please try again later.");
-      } else if (status === 401 || status === 403) {
-        throw new Error("Authentication failed. Session may be expired.");
-      } else if (status === 404) {
+      }else if (status === 404) {
         throw new Error("Resource not found.");
       }
     }
@@ -368,10 +264,9 @@ const fetchLeetCodeData = async (query, variables, sessionData = null) => {
  * Uses local cache to minimize API calls
  *
  * @param {string} titleSlug - Problem title slug (e.g., "two-sum")
- * @param {string|null} sessionData - Optional session data
  * @returns {Promise<Object>} Problem metadata including difficulty
  */
-const fetchProblemMetadata = async (titleSlug, sessionData = null) => {
+const fetchProblemMetadata = async (titleSlug) => {
   try {
     // Check cache first (if data is less than 7 days old)
     const cachedProblem = await prisma.problemMetadata.findUnique({
@@ -396,8 +291,7 @@ const fetchProblemMetadata = async (titleSlug, sessionData = null) => {
 
     const data = await fetchLeetCodeData(
       PROBLEM_DETAILS_QUERY,
-      { titleSlug },
-      sessionData
+      { titleSlug }
     );
 
     if (!data || !data.question) {
@@ -448,20 +342,15 @@ const fetchProblemMetadata = async (titleSlug, sessionData = null) => {
  * Enrich submissions with problem metadata (difficulty, etc.)
  *
  * @param {Array} submissions - Raw submissions from LeetCode
- * @param {string|null} sessionData - Optional session data
  * @returns {Promise<Array>} Enriched submissions with difficulty
  */
-const enrichSubmissionsWithMetadata = async (
-  submissions,
-  sessionData = null
-) => {
+const enrichSubmissionsWithMetadata = async (submissions) => {
   const enrichedSubmissions = [];
 
   for (const submission of submissions) {
     try {
       const metadata = await fetchProblemMetadata(
-        submission.titleSlug,
-        sessionData
+        submission.titleSlug
       );
 
       enrichedSubmissions.push({
@@ -497,54 +386,18 @@ const enrichSubmissionsWithMetadata = async (
 };
 
 /**
- * Validate if a session is still working
- *
- * @param {string} sessionData - Encrypted session data
- * @returns {Promise<boolean>} True if session is valid
- */
-const validateSession = async (sessionData , leetcodeUsername) => {
-  try {
-    const data = await fetchLeetCodeData(
-      USER_CALENDAR_QUERY,
-      { username: leetcodeUsername, year: new Date().getFullYear() },
-      sessionData
-    );
-    console.log(data);
-    console.log('tr' , !!data)
-    return !!data;
-  } catch (error) {
-    logger.warn("Session validation failed:", error.message);
-    return false;
-  }
-};
-
-/**
- * Invalidate (deactivate) a user's LeetCode session
- *
- * @param {string} userId - User ID
- */
-const invalidateUserSession = async (userId) => {
-  await prisma.leetCodeSession.updateMany({
-    where: { userId },
-    data: { isActive: false },
-  });
-  logger.info(`Invalidated LeetCode session for user: ${userId}`);
-};
-
 /**
  * Fetch user profile statistics from LeetCode
  *
  * @param {string} username - LeetCode username
- * @param {string|null} sessionData - Optional session data
  * @returns {Promise<Object>} User statistics
  */
-const fetchUserProfile = async (username, sessionData = null) => {
+const fetchUserProfile = async (username) => {
   try {
     const currentYear = new Date().getFullYear();
     const data = await fetchLeetCodeData(
       USER_CALENDAR_QUERY,
-      { username, year: currentYear },
-      sessionData
+      { username, year: currentYear }
     );
 
     if (!data || !data.matchedUser) {
@@ -576,12 +429,6 @@ module.exports = {
   fetchProblemMetadata,
   enrichSubmissionsWithMetadata,
   parseSubmissions,
-
-  // Session management
-  getUserSession,
-  storeUserSession,
-  validateSession,
-  invalidateUserSession,
 
   // Additional features
   fetchUserProfile,
